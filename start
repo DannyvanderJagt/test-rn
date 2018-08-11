@@ -1,0 +1,178 @@
+#!/usr/bin/env node
+
+const childProc = require('child_process');
+const fs = require('fs');
+
+function spawn(path, args) {
+	return new Promise( (accept, reject) => {
+		let proc = childProc.spawn(path, args||[], {
+			stdio: 'inherit'
+		});
+		proc.on('close', (code) => {
+			if (!code) {
+				accept(proc);
+			} else {
+				reject(new Error('exitCode:'+code));
+			}
+		});
+	});
+}
+
+function make(target) {
+	const targets = [].slice.apply(arguments);
+	console.log(`🚧  make ${targets.join(' ')}`);
+	return spawn('make', targets).catch( () => 0 );
+}
+
+function launch(name, path, args) {
+	spawn(path, args).then( (proc) => {
+		console.log(`🚀  ${name} started; pid=${proc.pid}`);
+	}).catch( (e) => {
+		console.log(`😕  ${name} exited; ${e}`);
+		setTimeout( () => launch(name, path, args), 2000);
+	});
+}
+
+function signalBackend() {
+	// const backendPID = fs.readFileSync('data/php.pid', 'utf8');
+	// return spawn('kill', ['-USR2', backendPID]);
+}
+
+process.on('exit', () => {
+	let killed = [];
+	['data/db/postmaster.pid', 'data/go.pid', 'data/php.pid'].map( (pidFile) => {
+		try {
+			const pid = +fs.readFileSync(pidFile, 'utf8').split("\n")[0];
+			spawn('kill', [pid]);
+			killed.push(pid);
+		} catch (e) {}
+	});
+	console.log("killed", killed.join(' '));
+});
+
+process.on('SIGINT', () => process.exit());
+
+make('app')
+// .then(() => {
+// 	if(!fs.existsSync("./data")) {
+// 		return spawn('./scripts/dataReset', ['clean']);
+// 	}
+// 	return true;
+// }).then(() => {
+// 	launch('db', '/usr/lib/postgresql/9.5/bin/postgres', ['-D', 'data/db']);
+// 	launch('go', 'built/backend/server.go', []);
+// 	launch('php', 'built/backend/server', ['-P', 'data/php.pid', '-s', 'data/php.sock', 'built/backend/index.php']);
+// 	require('node-watch')('backend/', {recursive: true}, (a,b) => {
+// 		if (b && b.match(/\.php$/)) {
+// 			make('backend').then( signalBackend );
+// 		}
+// 	});
+// })
+.catch( (e) => {
+	// initial build failed
+	console.warn(e);
+	process.exit(1);
+});
+
+const {startWorkers, Bundle} = require('./bundle.js');
+
+startWorkers(8);
+
+let bundles = [
+	// {output:'built/app/android/bundle.js', entry:'app/index.js', product: 'app', dev: true, release: 'dev', platform: 'android', plugins:['assets', 'haste']},
+	{output:'ios.bundle.js', entry:'index.js', product: 'app', dev: true, release: 'dev', platform: 'ios', plugins:['assets', 'haste']},
+	// {output:'built/app/web/bundle.js', entry:'app/index.js', product: 'app', dev: true, release: 'dev', platform: 'web', plugins:['assets']},
+	// {output:'built/admin/bundle.js', entry:'admin/index.js', product: 'admin', dev: true, release: 'dev', platform: 'web', plugins:['assets']},
+].map( (b) => {
+	const bundle = new Bundle(b);
+	let changes = {}; // {path: code}
+	bundle.onBundled = (ok) => {
+		console.log("onBundled", ok);
+		// if (ok) {
+		// 	signalBackend();
+		// 	if (Object.keys(changes).length > 0 && Object.keys(changes).length < 25) {
+		// 		hmrSignal(b.product, b.platform, changes);
+		// 	} // else no change or new build, don't do HMR
+		// }
+		changes = {};
+	};
+	bundle.onCompiledUnit = ({path,code,error}) => {
+		changes[path] = code;
+	};
+	return bundle;
+});
+
+bundles.reduce(
+	(p, bundle) => p.then( () => {
+		console.log(`🏁  initial build ${bundle.output}`);
+		return bundle.build();
+	}),
+	Promise.resolve()
+).then( () => {
+	const onChange = (type, path) => {
+		if (type !== 'update') {
+			return;
+		}
+		bundles.forEach( (bundle) => {
+			if (bundle.compiled[path]) {
+				console.log(`🏳   incremental build ${bundle.output}, ${path} changed`);
+
+				bundle.compile(path);
+			}
+		});
+	};
+
+	// require('node-watch')('app/', {recursive: true}, onChange);
+	// require('node-watch')('admin/', {recursive: true}, onChange);
+
+	console.log("watching for changes");
+});
+
+let hmrConns = []; // [{ product, platform, conn }, ...]
+
+function hmrSignal(product, platform, changes) {
+
+	console.log("hmr signal product=", product, "platform=", platform, "changed=", Object.keys(changes).length);
+
+	// remove prelude/postlude from bundle (and just have defines[] remaining)
+	// future: send changed modules
+	/*bundle = bundle
+		.replace(/^[\s\S]+?\n\tdefines\[/, 'var defines = global.defines; console.log("hmr start=", Object.keys(defines).length); defines[')
+		.replace(/require\("app\/index.js"\);$/, 'console.log("hmr done");');*/
+
+	const msg = JSON.stringify({type: 'hmr', product, platform, changes});
+	hmrConns.filter( (c) => c.product === product && c.platform === platform ).forEach( (c) => c.conn.sendUTF(msg) );
+}
+
+function hmrServe() {
+	const port = 10000+process.geteuid();
+
+	const WebSocketServer = require('websocket').server;
+	const https = require('https');
+
+	const options = {
+		key: fs.readFileSync('/home/freshco/data/certs/test.freshfoodventures.nl'),
+		cert: fs.readFileSync('/home/freshco/data/certs/test.freshfoodventures.nl'),
+	};
+	const server = https.createServer(options, function(request, response) {});
+	server.listen(port, function() {});
+
+	const wsServer = new WebSocketServer({httpServer: server});
+	wsServer.on('request', function(request) {
+		const c = {
+			conn: request.accept(null, request.origin),
+			product: request.resourceURL.query.product,
+			platform: request.resourceURL.query.platform,
+		};
+
+		console.log("hmr: +client product=", c.product, "platform=", c.platform);
+		hmrConns.push(c);
+
+		c.conn.on('close', () => {
+			console.log("hmr: -client");
+			hmrConns = hmrConns.filter( (x) => x !== c );
+		});
+	});
+}
+
+// hmrServe();
